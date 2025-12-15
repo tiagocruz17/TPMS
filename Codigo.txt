@@ -520,4 +520,7 @@ xTaskCreate(Task_MonitorIdle, "Task_MonitorIdle", 3072, NULL, 1, NULL);
 void loop()
 {
 vTaskDelete(NULL);
+
 }
+
+// https://youtu.be/RkSUYrOaNJ4
