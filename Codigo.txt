@@ -1,0 +1,523 @@
+/*Nome ALUNO A- Tiago Cruz
+Nome ALUNO B- Tiago Mateus
+IPLEIRIA - Instituto Politécnico de Leiria
+ESTG - Escola Superior de Tecnologia e Gestão
+LEAU- Licenciatura em Engenharia Automóvel
+SEEV - Sistemas Elétricos e Eletrónicos de Veículos*/
+ 
+//ESP32 #1 - Unidade de Sensores (TPMS)
+#include <Arduino.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include <esp32_can.h>
+#include <can_common.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include "esp_freertos_hooks.h"
+/* ===================== HARDWARE ===================== */
+#define ONE_WIRE_BUS 4
+#define ADC_PIN 34
+#define CAN_TX_GPIO GPIO_NUM_17
+#define CAN_RX_GPIO GPIO_NUM_15
+#define CAN_BAUDRATE 500000
+#define CAN_ID_TPMS 0x100
+/* ===================== ADC / CONVERSÕES ===================== */
+#define ADC_MAX 4095.0f
+#define VREF 3.3f
+// Conversão
+#define PRESS_OFFSET_V 0.25f
+#define PRESS_KPA_PER_V (10.0f / (3.3f - 0.25f))
+/* ===================== DADOS ===================== */
+typedef struct
+{
+float pressao_kPa;
+float temperatura_C;
+} TPMS_Data_t;
+/* ===================== OBJETOS GLOBAIS ===================== */
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature sensors(&oneWire);
+QueueHandle_t xQueue_Pressao = NULL;
+QueueHandle_t xQueue_Temperatura = NULL;
+QueueHandle_t xQueue_CAN_TX = NULL;
+/* ===================== IDLE HOOK ===================== */
+// Mede “tempo ocioso” do CPU
+volatile unsigned long contadorIdle = 0UL;
+bool FuncaoIdleHook(void)
+{
+contadorIdle++;
+return true;
+}
+/* ===================== FUNÇÕES AUXILIARES ===================== */
+static float converterADCparaTensao(int valorADC)
+{
+return (valorADC / ADC_MAX) * VREF;
+}
+static float converterTensaoParaPressao_kPa(float V)
+{
+float P = (V - PRESS_OFFSET_V) * PRESS_KPA_PER_V;
+if (P < 0.0f) P = 0.0f;
+return P;
+}
+static void CAN_init()
+{
+CAN0.setCANPins(CAN_RX_GPIO, CAN_TX_GPIO);
+CAN0.enable();
+CAN0.begin(CAN_BAUDRATE);
+}
+/* ===================== TASKS ===================== */
+// Leitura da pressão (ADC) -> envia para queue
+void Task_ADC_Sensor(void *pvParameters)
+{
+(void)pvParameters;
+for (;;)
+{
+int adcRaw = analogRead(ADC_PIN);
+float V = converterADCparaTensao(adcRaw);
+float PkPa = converterTensaoParaPressao_kPa(V);
+if (xQueue_Pressao != NULL)
+{
+xQueueSend(xQueue_Pressao, &PkPa, 0);
+}
+vTaskDelay(pdMS_TO_TICKS(50));
+}
+}
+// Leitura da temperatura (DS18B20) -> envia para queue
+void Task_Temp_Sensor(void *pvParameters)
+{
+(void)pvParameters;
+sensors.begin();
+for (;;)
+{
+sensors.requestTemperatures();
+float tempC = sensors.getTempCByIndex(0);
+if (xQueue_Temperatura != NULL)
+{
+xQueueSend(xQueue_Temperatura, &tempC, 0);
+}
+vTaskDelay(pdMS_TO_TICKS(500));
+}
+}
+// Agrega pressão (sempre) + temperatura (quando existir valor novo) -> envia pacote final
+void Task_Brain_Sensores(void *pvParameters)
+{
+(void)pvParameters;
+float pressao_kPa = 0.0f;
+float temperatura_C = 0.0f;
+TPMS_Data_t dado;
+for (;;)
+{
+// Pressão: sincroniza o ciclo (espera por novo valor)
+if (xQueue_Pressao != NULL)
+{
+xQueueReceive(xQueue_Pressao, &pressao_kPa, portMAX_DELAY);
+}
+// Temperatura: atualiza se houver novo valor (sem bloquear)
+if (xQueue_Temperatura != NULL)
+{
+float tempTemp;
+if (xQueueReceive(xQueue_Temperatura, &tempTemp, 0) == pdTRUE)
+{
+temperatura_C = tempTemp;
+}
+}
+dado.pressao_kPa = pressao_kPa;
+dado.temperatura_C = temperatura_C;
+if (xQueue_CAN_TX != NULL)
+{
+xQueueSend(xQueue_CAN_TX, &dado, 0);
+}
+}
+}
+// Envio CAN
+void Task_CAN_TX(void *pvParameters)
+{
+(void)pvParameters;
+TPMS_Data_t dado;
+CAN_FRAME frame;
+frame.rtr = 0;
+frame.id = CAN_ID_TPMS;
+frame.extended = false;
+frame.length = sizeof(TPMS_Data_t);
+for (;;)
+{
+if (xQueue_CAN_TX != NULL &&
+xQueueReceive(xQueue_CAN_TX, &dado, portMAX_DELAY) == pdTRUE)
+{
+memcpy(frame.data.uint8, &dado, sizeof(TPMS_Data_t));
+CAN0.sendFrame(frame);
+}
+}
+}
+// Monitorização do Idle Hook
+void Task_MonitorIdle(void *pvParameters)
+{
+(void)pvParameters;
+TickType_t xLastWakeTime = xTaskGetTickCount();
+unsigned long ultimoValor = 0;
+for (;;)
+{
+unsigned long atual = contadorIdle;
+unsigned long delta = atual - ultimoValor;
+ultimoValor = atual;
+Serial.print("[IDLE] delta_1s=");
+Serial.print(delta);
+Serial.print(" | total=");
+Serial.println(atual);
+vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(1000));
+}
+}
+/* ===================== SETUP / LOOP ===================== */
+void setup()
+{
+Serial.begin(115200);
+vTaskDelay(pdMS_TO_TICKS(200));
+// ADC configurado
+analogReadResolution(12);
+analogSetPinAttenuation(ADC_PIN, ADC_11db);
+// Registo do Idle Hook no core 1
+esp_register_freertos_idle_hook_for_cpu(FuncaoIdleHook, 1);
+// Queues
+xQueue_Pressao = xQueueCreate(10, sizeof(float));
+xQueue_Temperatura = xQueueCreate(10, sizeof(float));
+xQueue_CAN_TX = xQueueCreate(10, sizeof(TPMS_Data_t));
+if (xQueue_Pressao == NULL || xQueue_Temperatura == NULL || xQueue_CAN_TX == NULL)
+{
+// Falha crítica: sem queues não há funcionamento seguro
+for (;;)
+vTaskDelay(portMAX_DELAY);
+}
+CAN_init();
+// Todas as tasks
+xTaskCreatePinnedToCore(Task_ADC_Sensor, "Task_ADC_Sensor", 4096, NULL, 4, NULL, 1);
+xTaskCreatePinnedToCore(Task_Temp_Sensor, "Task_Temp_Sensor", 4096, NULL, 3, NULL, 1);
+xTaskCreatePinnedToCore(Task_Brain_Sensores, "Task_Brain_Sensores", 4096, NULL, 5, NULL, 1);
+xTaskCreatePinnedToCore(Task_CAN_TX, "Task_CAN_TX", 4096, NULL, 2, NULL, 1);
+xTaskCreatePinnedToCore(Task_MonitorIdle, "Task_MonitorIdle", 3072, NULL, 1, NULL, 1);
+}
+void loop()
+{
+vTaskDelete(NULL);
+}
+
+
+//ESP32 #2 - Unidade de Visualização (TPMS)
+
+#include <Arduino.h>
+#include <SPI.h>
+#include <math.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ILI9341.h>
+#include <esp32_can.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+#include "esp_freertos_hooks.h"
+/* ===================== IDLE HOOK ===================== */
+// Contador de atividade da Idle Task
+volatile unsigned long contadorIdle = 0UL;
+bool FuncaoIdleHook(void)
+{
+contadorIdle++;
+return true;
+}
+void Task_MonitorIdle(void *pvParameters);
+/* ===================== TFT (ILI9341) ===================== */
+#define TFT_CS 5
+#define TFT_DC 26
+#define TFT_MOSI 23
+#define TFT_MISO 19
+#define TFT_SCLK 18
+#define TFT_RST -1
+Adafruit_ILI9341 tft(TFT_CS, TFT_DC, TFT_MOSI, TFT_SCLK, TFT_RST, TFT_MISO);
+/* Posições dos elementos gráficos */
+const int centroTempX = 60;
+const int centroTempY = 240;
+const int centroPressX = 180;
+const int centroPressY = 240;
+const int raioExterno = 45;
+const int raioInterno = 42;
+/* Área ESTADO */
+const int estadoBoxX = 10;
+const int estadoBoxY = 150;
+const int estadoBoxW = 220;
+const int estadoBoxH = 20;
+const int estadoTextoX = 20;
+const int estadoTextoY = 152;
+/* ===================== CAN ===================== */
+#define CAN_RX_PIN GPIO_NUM_15
+#define CAN_TX_PIN GPIO_NUM_17
+#define CAN_BITRATE 500000
+#define CAN_ID_TPMS 0x100
+typedef struct
+{
+float pressao_kPa;
+float temperatura_C;
+} TPMS_Data_t;
+/* ===================== BUZZER ===================== */
+#define BUZZER_PIN 2
+#define BUZZER_ON HIGH
+#define BUZZER_OFF LOW
+/* ===================== LIMITES ===================== */
+const float PRESSAO_PERIGO_MIN = 6.60f;
+const float PRESSAO_AVISO_MIN = 6.70f;
+const float PRESSAO_AVISO_MAX = 6.95f;
+const float PRESSAO_PERIGO_MAX = 7.05f;
+const float TEMP_AVISO = 20.0f;
+const float TEMP_PERIGO = 25.0f;
+/* ===================== ESTADOS ===================== */
+const uint8_t ESTADO_OK = 0;
+const uint8_t ESTADO_AVISO = 1;
+const uint8_t ESTADO_PERIGO = 2;
+/* Estado atual do sistema (partilhado entre tasks) */
+typedef struct
+{
+float pressao_kPa;
+float temperatura_C;
+uint8_t estado;
+} TPMS_Info_t;
+TPMS_Info_t g_tpmsInfo = {0.0f, 0.0f, ESTADO_OK};
+SemaphoreHandle_t xMutexTPMS = NULL;
+/* ===================== PROTÓTIPOS ===================== */
+uint8_t avaliarEstadoPneu(float pressao_kPa, float temperatura_C);
+const char* estadoToString(uint8_t estado);
+void desenharLayoutFixo();
+void actualizarTemperaturaNoDisplay(float temperatura);
+void actualizarPressaoNoDisplay(float pressao);
+void actualizarEstadoNoDisplay(uint8_t estado);
+/* ===================== LÓGICA DO ESTADO ===================== */
+uint8_t avaliarEstadoPneu(float pressao_kPa, float temperatura_C)
+{
+if (pressao_kPa < PRESSAO_PERIGO_MIN) return ESTADO_PERIGO;
+if (pressao_kPa > PRESSAO_PERIGO_MAX) return ESTADO_PERIGO;
+if (temperatura_C > TEMP_PERIGO) return ESTADO_PERIGO;
+if (pressao_kPa < PRESSAO_AVISO_MIN) return ESTADO_AVISO;
+if (pressao_kPa > PRESSAO_AVISO_MAX) return ESTADO_AVISO;
+if (temperatura_C > TEMP_AVISO) return ESTADO_AVISO;
+return ESTADO_OK;
+}
+const char* estadoToString(uint8_t estado)
+{
+switch (estado)
+{
+case ESTADO_OK: return "OK";
+case ESTADO_AVISO: return "AVISO";
+case ESTADO_PERIGO: return "PERIGO";
+default: return "ERRO";
+}
+}
+/* ===================== DESENHO TFT ===================== */
+void desenharLayoutFixo()
+{
+tft.begin();
+tft.setRotation(1);
+tft.fillScreen(ILI9341_BLACK);
+tft.setCursor(0, 10);
+tft.setTextColor(ILI9341_WHITE);
+tft.setTextSize(2);
+tft.println(" SEEV ");
+tft.println(" Eng.Automovel ");
+tft.println(" 2025/2026 ");
+tft.drawRect(5, 5, 230, 70, ILI9341_RED);
+tft.drawRect(6, 6, 228, 68, ILI9341_RED);
+tft.fillRoundRect(0, 105, 250, 24, 8, ILI9341_RED);
+tft.setCursor(100, 110);
+tft.setTextColor(ILI9341_WHITE);
+tft.setTextSize(2);
+tft.println("TPMS");
+tft.fillCircle(centroTempX, centroTempY, raioExterno, ILI9341_YELLOW);
+tft.fillCircle(centroTempX, centroTempY, raioInterno, ILI9341_BLACK);
+tft.setTextSize(1);
+tft.setTextColor(ILI9341_WHITE);
+tft.setCursor(centroTempX - 35, centroTempY + raioExterno + 8);
+tft.print("TEMPERATURA");
+tft.fillCircle(centroPressX, centroPressY, raioExterno, ILI9341_YELLOW);
+tft.fillCircle(centroPressX, centroPressY, raioInterno, ILI9341_BLACK);
+tft.setCursor(centroPressX - 21, centroPressY + raioExterno + 8);
+tft.print("PRESSAO");
+tft.fillRect(estadoBoxX, estadoBoxY, estadoBoxW, estadoBoxH, ILI9341_BLACK);
+tft.setTextSize(2);
+tft.setTextColor(ILI9341_WHITE);
+tft.setCursor(estadoTextoX, estadoTextoY);
+tft.print("ESTADO: ");
+}
+void actualizarTemperaturaNoDisplay(float temperatura)
+{
+tft.fillCircle(centroTempX, centroTempY, raioInterno, ILI9341_BLACK);
+tft.setTextSize(2);
+tft.setTextColor(ILI9341_WHITE, ILI9341_BLACK);
+tft.setCursor(centroTempX - 30, centroTempY - 8);
+tft.print(temperatura, 1);
+tft.print((char)167);
+tft.print("C");
+}
+void actualizarPressaoNoDisplay(float pressao)
+{
+tft.fillCircle(centroPressX, centroPressY, raioInterno, ILI9341_BLACK);
+tft.setTextSize(2);
+tft.setTextColor(ILI9341_WHITE, ILI9341_BLACK);
+tft.setCursor(centroPressX - 35, centroPressY - 8);
+tft.print(pressao, 2);
+tft.print("kPa");
+}
+void actualizarEstadoNoDisplay(uint8_t estado)
+{
+tft.fillRect(estadoTextoX, estadoTextoY, 200, 16, ILI9341_BLACK);
+tft.setTextSize(2);
+tft.setCursor(estadoTextoX, estadoTextoY);
+tft.setTextColor(ILI9341_WHITE);
+tft.print("ESTADO: ");
+switch (estado)
+{
+case ESTADO_OK: tft.setTextColor(ILI9341_GREEN); break;
+case ESTADO_AVISO: tft.setTextColor(ILI9341_CYAN); break;
+case ESTADO_PERIGO: tft.setTextColor(ILI9341_BLUE); break;
+default: tft.setTextColor(ILI9341_WHITE); break;
+}
+tft.print(estadoToString(estado));
+}
+/* ===================== TASKS ===================== */
+// Recebe frame CAN, calcula estado e atualiza estrutura partilhada
+void Task_CAN_RX_Brain(void *pvParameters)
+{
+(void)pvParameters;
+CAN_FRAME message;
+TPMS_Data_t dado;
+for (;;)
+{
+if (CAN0.read(message))
+{
+if (!message.extended && message.id == CAN_ID_TPMS && message.length == 8)
+{
+memcpy(&dado, message.data.uint8, sizeof(TPMS_Data_t));
+uint8_t estadoNovo = avaliarEstadoPneu(dado.pressao_kPa, dado.temperatura_C);
+if (xMutexTPMS != NULL && xSemaphoreTake(xMutexTPMS, portMAX_DELAY) == pdTRUE)
+{
+g_tpmsInfo.pressao_kPa = dado.pressao_kPa;
+g_tpmsInfo.temperatura_C = dado.temperatura_C;
+g_tpmsInfo.estado = estadoNovo;
+xSemaphoreGive(xMutexTPMS);
+}
+}
+}
+vTaskDelay(pdMS_TO_TICKS(5));
+}
+}
+// Atualiza apenas quando existe variação relevante
+void Task_Display(void *pvParameters)
+{
+(void)pvParameters;
+float pressaoLocal = -1000.0f;
+float temperaturaLocal = -1000.0f;
+uint8_t estadoLocal = 255;
+for (;;)
+{
+TPMS_Info_t dadosCopia;
+if (xMutexTPMS != NULL && xSemaphoreTake(xMutexTPMS, portMAX_DELAY) == pdTRUE)
+{
+dadosCopia = g_tpmsInfo;
+xSemaphoreGive(xMutexTPMS);
+}
+if (fabs(dadosCopia.temperatura_C - temperaturaLocal) > 0.05f)
+{
+temperaturaLocal = dadosCopia.temperatura_C;
+actualizarTemperaturaNoDisplay(temperaturaLocal);
+}
+if (fabs(dadosCopia.pressao_kPa - pressaoLocal) > 0.01f)
+{
+pressaoLocal = dadosCopia.pressao_kPa;
+actualizarPressaoNoDisplay(pressaoLocal);
+}
+if (dadosCopia.estado != estadoLocal)
+{
+estadoLocal = dadosCopia.estado;
+actualizarEstadoNoDisplay(estadoLocal);
+}
+vTaskDelay(pdMS_TO_TICKS(100));
+}
+}
+// Padrões sonoros: OK (off), AVISO (lento), PERIGO (rápido)
+void Task_Buzzer(void *pvParameters)
+{
+(void)pvParameters;
+pinMode(BUZZER_PIN, OUTPUT);
+digitalWrite(BUZZER_PIN, BUZZER_OFF);
+uint8_t estadoLocal = 255;
+for (;;)
+{
+uint8_t estadoAtualLocal = ESTADO_OK;
+if (xMutexTPMS != NULL && xSemaphoreTake(xMutexTPMS, portMAX_DELAY) == pdTRUE)
+{
+estadoAtualLocal = g_tpmsInfo.estado;
+xSemaphoreGive(xMutexTPMS);
+}
+if (estadoAtualLocal != estadoLocal)
+{
+estadoLocal = estadoAtualLocal;
+digitalWrite(BUZZER_PIN, BUZZER_OFF);
+vTaskDelay(pdMS_TO_TICKS(50));
+}
+switch (estadoAtualLocal)
+{
+case ESTADO_OK:
+digitalWrite(BUZZER_PIN, BUZZER_OFF);
+vTaskDelay(pdMS_TO_TICKS(200));
+break;
+case ESTADO_AVISO:
+digitalWrite(BUZZER_PIN, BUZZER_ON);
+vTaskDelay(pdMS_TO_TICKS(150));
+digitalWrite(BUZZER_PIN, BUZZER_OFF);
+vTaskDelay(pdMS_TO_TICKS(850));
+break;
+case ESTADO_PERIGO:
+digitalWrite(BUZZER_PIN, BUZZER_ON);
+vTaskDelay(pdMS_TO_TICKS(150));
+digitalWrite(BUZZER_PIN, BUZZER_OFF);
+vTaskDelay(pdMS_TO_TICKS(150));
+break;
+default:
+digitalWrite(BUZZER_PIN, BUZZER_OFF);
+vTaskDelay(pdMS_TO_TICKS(200));
+break;
+}
+}
+}
+// Monitorização do Idle Hook
+void Task_MonitorIdle(void *pvParameters)
+{
+(void)pvParameters;
+TickType_t xLastWakeTime = xTaskGetTickCount();
+unsigned long ultimoValor = 0;
+for (;;)
+{
+unsigned long atual = contadorIdle;
+unsigned long delta = atual - ultimoValor;
+ultimoValor = atual;
+Serial.print("[IDLE] delta_1s=");
+Serial.print(delta);
+Serial.print(" | total=");
+Serial.println(atual);
+vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(1000));
+}
+}
+/* ===================== SETUP / LOOP ===================== */
+void setup()
+{
+Serial.begin(115200);
+vTaskDelay(pdMS_TO_TICKS(200));
+esp_register_freertos_idle_hook_for_cpu(FuncaoIdleHook, 1);
+desenharLayoutFixo();
+CAN0.setCANPins(CAN_RX_PIN, CAN_TX_PIN);
+CAN0.enable();
+CAN0.begin(CAN_BITRATE);
+// Filtro para processar apenas o ID do TPMS
+CAN0.watchFor(CAN_ID_TPMS);
+xMutexTPMS = xSemaphoreCreateMutex();
+xTaskCreate(Task_CAN_RX_Brain, "Task_CAN_RX_Brain", 4096, NULL, 4, NULL);
+xTaskCreate(Task_Display, "Task_Display", 4096, NULL, 3, NULL);
+xTaskCreate(Task_Buzzer, "Task_Buzzer", 2048, NULL, 2, NULL);
+xTaskCreate(Task_MonitorIdle, "Task_MonitorIdle", 3072, NULL, 1, NULL);
+}
+void loop()
+{
+vTaskDelete(NULL);
+}
